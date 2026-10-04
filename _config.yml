@@ -1,7 +1,7 @@
 title: Security Writeups
 description: HTB boxes, CTFs, and security research notes.
 baseurl: "/Writeups"
-# url: "https://<your-username>.github.io"   # set this once the repo is pushed
+url: "https://DiogoRoq.github.io"
 
 remote_theme: just-the-docs/just-the-docs
 plugins:
@@ -13,7 +13,7 @@ search_enabled: true
 
 aux_links:
   "View on GitHub":
-    - "https://github.com/<your-username>/Writeups"
+    - "https://github.com/DiogoRoq/Writeups"
 aux_links_new_tab: true
 
 heading_anchors: true

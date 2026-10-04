@@ -2,7 +2,7 @@
 
 A Jekyll site (theme: [just-the-docs](https://github.com/just-the-docs/just-the-docs)) collecting HTB box writeups, CTF solves, and security research notes, hosted on GitHub Pages.
 
-**Live site:** `https://<your-username>.github.io/Writeups/` (update once Pages is enabled)
+**Live site:** https://DiogoRoq.github.io/Writeups/
 
 ## Structure
 
