@@ -1,0 +1,28 @@
+title: Security Writeups
+description: HTB boxes, CTFs, and security research notes.
+baseurl: "/Writeups"
+# url: "https://<your-username>.github.io"   # set this once the repo is pushed
+
+remote_theme: just-the-docs/just-the-docs
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+
+color_scheme: dark
+search_enabled: true
+
+aux_links:
+  "View on GitHub":
+    - "https://github.com/<your-username>/Writeups"
+aux_links_new_tab: true
+
+heading_anchors: true
+
+nav_sort: case_insensitive
+
+footer_content: "All content for authorized security testing / CTF / educational purposes."
+
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
